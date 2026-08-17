@@ -387,4 +387,340 @@ describe('modules/manager/pants/extract', () => {
       expect(await extractAllPackageFiles({}, ['BUILD.pants'])).toEqual([]);
     });
   });
+  describe('resolves', () => {
+    const pantsToml = codeBlock`
+      [python]
+      enable_resolves = true
+      default_resolve = "py311"
+
+      [python.resolves]
+      py311 = "3rdparty/python/py311.lock"
+      py312 = "3rdparty/python/py312.lock"
+      data-science = "3rdparty/python/data-science.lock"
+    `;
+
+    it('reads the resolve from the target field', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'BUILD.pants': codeBlock`
+          python_requirement(
+              name="click",
+              requirements=["click==8.1.7"],
+              resolve="data-science",
+          )
+        `,
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0]).toMatchObject({
+        lockFiles: ['3rdparty/python/data-science.lock'],
+        deps: [
+          {
+            depName: 'click',
+            managerData: {
+              resolves: ['data-science'],
+              resolveSource: 'field',
+              lockFiles: ['3rdparty/python/data-science.lock'],
+            },
+          },
+        ],
+      });
+    });
+
+    it('reads every resolve of a parametrized field', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'BUILD.pants': codeBlock`
+          python_requirement(
+              name="click",
+              requirements=["click==8.1.7"],
+              resolve=parametrize("py311", "py312"),
+          )
+        `,
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0]).toMatchObject({
+        managerData: {
+          resolves: ['py311', 'py312'],
+          resolveSource: 'field',
+          lockFiles: [
+            '3rdparty/python/py311.lock',
+            '3rdparty/python/py312.lock',
+          ],
+        },
+      });
+    });
+
+    it('falls back to default_resolve', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'BUILD.pants': 'python_requirement(requirements=["click==8.1.7"])\n',
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0]).toMatchObject({
+        managerData: {
+          resolves: ['py311'],
+          resolveSource: 'default_resolve',
+          lockFiles: ['3rdparty/python/py311.lock'],
+        },
+      });
+    });
+
+    it('applies __defaults__ from the same build file', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'BUILD.pants': codeBlock`
+          __defaults__(extend=True, all=dict(resolve="py312"))
+
+          python_requirement(requirements=["click==8.1.7"])
+        `,
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0]).toMatchObject({
+        managerData: {
+          resolves: ['py312'],
+          resolveSource: 'defaults',
+          lockFiles: ['3rdparty/python/py312.lock'],
+        },
+      });
+    });
+
+    it('inherits __defaults__ from the nearest ancestor build file', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'apps/BUILD.pants': '__defaults__(all=dict(resolve="py312"))\n',
+        'apps/svc/pkg/BUILD.pants':
+          'python_requirement(requirements=["click==8.1.7"])\n',
+      });
+
+      const res = await extractAllPackageFiles({}, [
+        'apps/BUILD.pants',
+        'apps/svc/pkg/BUILD.pants',
+      ]);
+      expect(res[0].deps[0]).toMatchObject({
+        managerData: { resolves: ['py312'], resolveSource: 'defaults' },
+      });
+    });
+
+    it('prefers the nearest ancestor defaults', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'apps/BUILD.pants': '__defaults__(all=dict(resolve="py312"))\n',
+        'apps/svc/BUILD.pants':
+          '__defaults__(all=dict(resolve="data-science"))\n',
+        'apps/svc/pkg/BUILD.pants':
+          'python_requirement(requirements=["click==8.1.7"])\n',
+      });
+
+      const res = await extractAllPackageFiles({}, [
+        'apps/BUILD.pants',
+        'apps/svc/BUILD.pants',
+        'apps/svc/pkg/BUILD.pants',
+      ]);
+      const dep = res.find((f) => f.packageFile === 'apps/svc/pkg/BUILD.pants')!
+        .deps[0];
+      expect(dep).toMatchObject({
+        managerData: { resolves: ['data-science'] },
+      });
+    });
+
+    it('drops inherited defaults when a call does not extend', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'apps/BUILD.pants': '__defaults__(all=dict(resolve="py312"))\n',
+        'apps/svc/BUILD.pants': codeBlock`
+          __defaults__(all=dict(skip_mypy=True))
+
+          python_requirement(requirements=["click==8.1.7"])
+        `,
+      });
+
+      const res = await extractAllPackageFiles({}, [
+        'apps/BUILD.pants',
+        'apps/svc/BUILD.pants',
+      ]);
+      expect(res[0].deps[0]).toMatchObject({
+        managerData: { resolves: ['py311'], resolveSource: 'default_resolve' },
+      });
+    });
+
+    it('scopes a per-target-type __defaults__ mapping to those types', async () => {
+      // A shape seen in the wild: source targets are parametrized over two
+      // resolves while the requirement generator is pinned to one.
+      mockFiles({
+        'pants.toml': pantsToml,
+        'pkg/BUILD.pants': codeBlock`
+          __defaults__(
+              {
+                  (python_sources, python_tests): dict(
+                      **parametrize("py311", resolve="py311"),
+                      **parametrize("py312", resolve="py312"),
+                  ),
+                  (poetry_requirements): dict(
+                      **parametrize("py311", resolve="py311"),
+                  ),
+              },
+              all=dict(skip_mypy=False),
+              extend=True,
+          )
+
+          poetry_requirements(name="poetry")
+        `,
+        'pkg/pyproject.toml': codeBlock`
+          [tool.poetry.dependencies]
+          requests = "^2.31.0"
+        `,
+      });
+
+      const res = await extractAllPackageFiles({}, ['pkg/BUILD.pants']);
+      expect(res[0].deps[0]).toMatchObject({
+        depName: 'requests',
+        managerData: { resolves: ['py311'], resolveSource: 'defaults' },
+      });
+    });
+
+    it('annotates a generator source with the generator resolve', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'BUILD.pants': codeBlock`
+          python_requirements(
+              name="reqs",
+              resolve=parametrize("py311", "py312"),
+          )
+        `,
+        'requirements.txt': 'click==8.1.7\n',
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0]).toMatchObject({
+        packageFile: 'requirements.txt',
+        lockFiles: ['3rdparty/python/py311.lock', '3rdparty/python/py312.lock'],
+        deps: [
+          {
+            depName: 'click',
+            managerData: { resolves: ['py311', 'py312'] },
+          },
+        ],
+      });
+    });
+
+    it('unions the resolves of two targets sharing one source', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'BUILD.pants': codeBlock`
+          python_requirements(name="a", resolve="py311")
+          python_requirements(name="b", resolve="py312")
+        `,
+        'requirements.txt': 'click==8.1.7\n',
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res).toHaveLength(1);
+      expect(res[0]).toMatchObject({
+        packageFile: 'requirements.txt',
+        lockFiles: ['3rdparty/python/py311.lock', '3rdparty/python/py312.lock'],
+        deps: [
+          {
+            depName: 'click',
+            managerData: { resolves: ['py311', 'py312'] },
+          },
+        ],
+      });
+    });
+
+    it('does not union resolves when they are not enabled', async () => {
+      mockFiles({
+        'pants.toml': '[python]\nenable_resolves = false\n',
+        'BUILD.pants': codeBlock`
+          python_requirements(name="a", resolve="py311")
+          python_requirements(name="b", resolve="py312")
+        `,
+        'requirements.txt': 'click==8.1.7\n',
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res).toHaveLength(1);
+      expect(res[0].deps[0].managerData).toBeUndefined();
+    });
+
+    it('reads a string-keyed __defaults__ mapping', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'BUILD.pants': codeBlock`
+          __defaults__({"python_requirement": {"resolve": "py312"}})
+
+          python_requirement(requirements=["click==8.1.7"])
+        `,
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0]).toMatchObject({
+        managerData: { resolves: ['py312'], resolveSource: 'defaults' },
+      });
+    });
+
+    it('reads a symbol-keyed __defaults__ mapping', async () => {
+      mockFiles({
+        'pants.toml': pantsToml,
+        'BUILD.pants': codeBlock`
+          __defaults__({python_requirement: dict(resolve="data-science")})
+
+          python_requirement(requirements=["click==8.1.7"])
+        `,
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0]).toMatchObject({
+        managerData: { resolves: ['data-science'], resolveSource: 'defaults' },
+      });
+    });
+
+    it('annotates nothing when resolves are not enabled', async () => {
+      mockFiles({
+        'pants.toml': '[python]\nenable_resolves = false\n',
+        'BUILD.pants':
+          'python_requirement(requirements=["click==8.1.7"], resolve="py311")\n',
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0].managerData).toBeUndefined();
+      expect(res[0].lockFiles).toBeUndefined();
+    });
+
+    it('annotates resolves without a lockfile path', async () => {
+      mockFiles({
+        'pants.toml': '[python]\nenable_resolves = true\n',
+        'BUILD.pants':
+          'python_requirement(requirements=["click==8.1.7"], resolve="mystery")\n',
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0]).toMatchObject({
+        managerData: { resolves: ['mystery'], lockFiles: [] },
+      });
+      expect(res[0].lockFiles).toBeUndefined();
+    });
+
+    it('ignores an unparseable pants.toml', async () => {
+      mockFiles({
+        'pants.toml': 'this is not toml [[[',
+        'BUILD.pants': 'python_requirement(requirements=["click==8.1.7"])\n',
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0].managerData).toBeUndefined();
+    });
+
+    it('skips annotation without a pants.toml', async () => {
+      mockFiles({
+        'BUILD.pants': 'python_requirement(requirements=["click==8.1.7"])\n',
+      });
+
+      const res = await extractAllPackageFiles({}, ['BUILD.pants']);
+      expect(res[0].deps[0].managerData).toBeUndefined();
+    });
+  });
 });
